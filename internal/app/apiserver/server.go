@@ -4,18 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"net/http"
 
 	"github.com/DmitryZzz/http-rest-api/internal/app/model"
 	"github.com/DmitryZzz/http-rest-api/internal/app/store"
+	"github.com/google/uuid"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
+	"github.com/sirupsen/logrus"
 )
 
 const (
-	sessionName = "gopherschool"
-	ctxKeyUser ctxKey = iota
+	sessionName        = "gopherschool"
+	ctxKeyUser  ctxKey = iota
+	ctxKeyRequestID
 )
 
 var (
@@ -27,6 +32,7 @@ type ctxKey int8
 
 type server struct {
 	router       *mux.Router
+	logger       *logrus.Logger
 	store        store.Store
 	sessionStore sessions.Store
 }
@@ -34,6 +40,7 @@ type server struct {
 func newServer(store store.Store, sessionStore sessions.Store) *server {
 	s := &server{
 		router:       mux.NewRouter(),
+		logger:       logrus.New(),
 		store:        store,
 		sessionStore: sessionStore,
 	}
@@ -47,7 +54,14 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // curl localhost:8080/sessions -d '{"email":"user2@example.org", "password":"password2"}'
+// curl -b cookie.txt -c cookie.txt -v localhost:8080/sessions -d '{"email":"user2@example.org", "password":"password2"}'
+// curl -v --cookie cookie.txt localhost:8080/private/whoami
+// curl -v --cookie cookie.txt localhost:8080/private/whoami -H "Origin: google.com"
+
 func (s *server) configureRouter() {
+	s.router.Use(s.setRequestID)
+	s.router.Use(s.logRequest)
+	s.router.Use(handlers.CORS(handlers.AllowedOrigins([]string{"*"})))
 	s.router.HandleFunc("/users", s.handleUsersCreate()).Methods("POST")
 	s.router.HandleFunc("/sessions", s.handleSessionsCreate()).Methods("POST")
 
@@ -55,6 +69,34 @@ func (s *server) configureRouter() {
 	private := s.router.PathPrefix("/private").Subrouter()
 	private.Use(s.authenticateUser)
 	private.HandleFunc("/whoami", s.handleWhoami()).Methods("GET")
+}
+
+func (s *server) setRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := uuid.New().String()
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyRequestID, id)))
+	})
+}
+
+func (s *server) logRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logger := s.logger.WithFields(logrus.Fields{
+			"remote_addr": r.RemoteAddr,
+			"request_id":  r.Context().Value(ctxKeyRequestID),
+		})
+		// started GET /blabla
+		logger.Infof("started %s %s", r.Method, r.RequestURI)
+		start := time.Now()
+		rw := &responseWriter{w, http.StatusOK}
+		next.ServeHTTP(rw, r)
+		logger.Infof(
+			"completed with %d %s in %v",
+			rw.code,
+			http.StatusText(rw.code),
+			time.Now().Sub(start),
+		)
+	})
 }
 
 func (s *server) authenticateUser(next http.Handler) http.Handler {
@@ -82,7 +124,7 @@ func (s *server) authenticateUser(next http.Handler) http.Handler {
 
 func (s *server) handleWhoami() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s.respond(w ,r, http.StatusOK, r.Context().Value(ctxKeyUser).(*model.User))
+		s.respond(w, r, http.StatusOK, r.Context().Value(ctxKeyUser).(*model.User))
 	}
 }
 
